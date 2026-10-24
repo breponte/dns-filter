@@ -3,18 +3,16 @@
 #include <string.h>
 #include <ctype.h>
 
-#define MAX_DOMAINS 1000000
-static char domains[MAX_DOMAINS][256];
-static int  ndomains = 0;
+#include "load.h"
 
 int load_blocklist(const char *path)
 {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
 
-    static char tmp[MAX_DOMAINS][256];   // load into a temp list first
+    static char tmp[MAX_DOMAINS][MAX_DOMAIN_LENGTH];   // load into a temp list first
     int n = 0;
-    char line[256];
+    char line[MAX_DOMAIN_LENGTH];
     while (n < MAX_DOMAINS && fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = '\0';
         char *p = line;
@@ -32,33 +30,4 @@ int load_blocklist(const char *path)
     memcpy(domains, tmp, sizeof tmp);
     ndomains = n;
     return n;
-}
-
-int main(int argc, char *argv[])
-{
-    const char *path = (argc > 1) ? argv[1] : "C:\\Users\\brepo\\OneDrive\\Desktop\\playground\\dns-filter\\blocked.txt";
-    if (load_blocklist(path) < 0) {
-        fprintf(stderr, "Failed to load blocklist: %s\n", path);
-        return 1;                            // non-zero exit shows up as a failed service
-    }
-
-    char buff[256];
-    while (1) {
-        fgets(buff, sizeof(buff), stdin);
-        for (int j = 0; j < sizeof(buff); j++) {
-            if (buff[j] == '\n' || buff[j] == '\r') {
-                buff[j] = '\0';
-                break;
-            }
-        }
-        for (int i = 0; i < ndomains; i++) {
-            if (strcmp(buff, domains[i]) == 0) {
-                printf("Blocked: %s\n", buff);
-                break;
-            }
-            
-        }
-    }
-    
-    return 0;
 }
