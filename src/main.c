@@ -61,12 +61,7 @@ int main()
 			exit(EXIT_FAILURE);
 		}
 		
-		//print details of the client/peer and the data received
-		printf("Received packet from %s:%d\n", inet_ntoa(si_other.sin_addr), ntohs(si_other.sin_port));
-		printf("Received %d bytes\n", recv_len);
         #define HEADER_SIZE 2
-        for (int i = HEADER_SIZE; i < recv_len; i++) printf("%02x ", (unsigned char)buf[i]);
-        printf("\n");
         for (int i = HEADER_SIZE; i < recv_len; i++) printf("%c", (unsigned char)buf[i]);
         printf("\n");
 	}
