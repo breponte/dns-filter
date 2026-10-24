@@ -16,13 +16,13 @@ int main()
 	slen = sizeof(si_other);
 	
 	// Initialise winsock
-	printf("\nInitialising Winsock...");
+	// printf("\nInitialising Winsock...");
 	if (WSAStartup(MAKEWORD(2,2),&wsa) != 0)
 	{
 		fprintf(stderr, "Failed. Error Code : %d", WSAGetLastError());
 		exit(EXIT_FAILURE);
 	}
-	printf("Initialised.\n");
+	// printf("Initialised.\n");
 	
 	// Create a socket
 	if((s = socket(AF_INET , SOCK_DGRAM , 0)) == INVALID_SOCKET)
@@ -30,7 +30,7 @@ int main()
 		fprintf(stderr, "Could not create socket : %d" , WSAGetLastError());
         exit(EXIT_FAILURE);
 	}
-	printf("Socket created.\n");
+	// printf("Socket created.\n");
 	
 	// Prepare the sockaddr_in structure
 	server.sin_family = AF_INET;
@@ -43,12 +43,12 @@ int main()
 		fprintf(stderr, "Bind failed with error code : %d" , WSAGetLastError());
 		exit(EXIT_FAILURE);
 	}
-	puts("Bind done");
+	// printf("Bind done");
 
 	// Keep listening for data
 	while(1)
 	{
-		printf("Waiting for data...");
+		// printf("Waiting for data...");
 		fflush(stdout);
 		
 		//clear the buffer by filling null, it might have previously received data
@@ -64,7 +64,10 @@ int main()
 		//print details of the client/peer and the data received
 		printf("Received packet from %s:%d\n", inet_ntoa(si_other.sin_addr), ntohs(si_other.sin_port));
 		printf("Received %d bytes\n", recv_len);
-        for (int i = 0; i < recv_len; i++) printf("%02x ", (unsigned char)buf[i]);
+        #define HEADER_SIZE 2
+        for (int i = HEADER_SIZE; i < recv_len; i++) printf("%02x ", (unsigned char)buf[i]);
+        printf("\n");
+        for (int i = HEADER_SIZE; i < recv_len; i++) printf("%c", (unsigned char)buf[i]);
         printf("\n");
 	}
 
