@@ -76,13 +76,88 @@ static int is_blocked(const char *name)
 }
 
 
-int main()
+/* ---------------------------------------------------------------------------
+ * Service plumbing
+ * ------------------------------------------------------------------------- */
+
+#define SERVICE_NAME "DNSFilter"
+
+static SERVICE_STATUS_HANDLE g_status_handle = NULL;    /* NULL when running in a console */
+static SERVICE_STATUS g_status;
+static volatile LONG g_stopping = 0;
+static SOCKET g_listen = INVALID_SOCKET;
+static char g_blocklist_path[MAX_PATH + 32];   /* exe dir + "\..\blocked.txt" */
+
+static void set_status(DWORD state, DWORD win32_exit)
+{
+    if (!g_status_handle) return;
+    g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    g_status.dwCurrentState = state;
+    g_status.dwControlsAccepted = (state == SERVICE_RUNNING) ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
+    g_status.dwWin32ExitCode = win32_exit;
+    g_status.dwWaitHint = (state == SERVICE_START_PENDING || state == SERVICE_STOP_PENDING) ? 10000 : 0;
+    SetServiceStatus(g_status_handle, &g_status);
+}
+
+/* Ask the receive loop to exit: closing the socket unblocks recvfrom(). */
+static void request_stop(void)
+{
+    InterlockedExchange(&g_stopping, 1);
+    if (g_listen != INVALID_SOCKET) closesocket(g_listen);
+}
+
+static DWORD WINAPI service_ctrl(DWORD ctrl, DWORD type, LPVOID data, LPVOID ctx)
+{
+    (void)type; (void)data; (void)ctx;
+    switch (ctrl) {
+    case SERVICE_CONTROL_STOP:
+    case SERVICE_CONTROL_SHUTDOWN:
+        set_status(SERVICE_STOP_PENDING, NO_ERROR);
+        request_stop();
+        return NO_ERROR;
+    case SERVICE_CONTROL_INTERROGATE:
+        return NO_ERROR;
+    }
+    return ERROR_CALL_NOT_IMPLEMENTED;
+}
+
+static BOOL WINAPI console_ctrl(DWORD type)
+{
+    (void)type;
+    request_stop();                          /* Ctrl+C in a console: shut down cleanly */
+    return TRUE;
+}
+
+/* Default blocklist location: next to the exe, or one folder up (the src\ dev layout). */
+static void resolve_blocklist_path(int argc, char *argv[])
+{
+    if (argc > 1) {
+        snprintf(g_blocklist_path, sizeof g_blocklist_path, "%s", argv[1]);
+        return;
+    }
+    char dir[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, dir, sizeof dir);
+    if (n == 0 || n >= sizeof dir) { snprintf(g_blocklist_path, sizeof g_blocklist_path, "blocked.txt"); return; }
+    char *slash = strrchr(dir, '\\');
+    if (slash) *slash = '\0';
+
+    snprintf(g_blocklist_path, sizeof g_blocklist_path, "%s\\blocked.txt", dir);
+    if (GetFileAttributesA(g_blocklist_path) == INVALID_FILE_ATTRIBUTES)
+        snprintf(g_blocklist_path, sizeof g_blocklist_path, "%s\\..\\blocked.txt", dir);
+}
+
+
+/* ---------------------------------------------------------------------------
+ * DNS server. Returns 0 on a clean stop, otherwise a Win32 error code.
+ * ------------------------------------------------------------------------- */
+
+static int run_server(void)
 {
     // Initialize the blocklist
-    const char *path = "C:\\Users\\brepo\\OneDrive\\Desktop\\playground\\dns-filter\\blocked.txt";
+    const char *path = g_blocklist_path;
     if (load_blocklist(path) < 0) {
         fprintf(stderr, "Failed to load blocklist: %s\n", path);
-        return 1;                            // non-zero exit shows up as a failed service
+        return ERROR_FILE_NOT_FOUND;         // non-zero exit shows up as a failed service
     }
 
 	SOCKET s;
@@ -98,16 +173,19 @@ int main()
 	if (WSAStartup(MAKEWORD(2,2),&wsa) != 0)
 	{
 		fprintf(stderr, "Failed. Error Code : %d", WSAGetLastError());
-		exit(EXIT_FAILURE);
+		return WSAGetLastError();
 	}
 	// printf("Initialised.\n");
-	
+
 	// Create a socket
 	if((s = socket(AF_INET , SOCK_DGRAM , 0)) == INVALID_SOCKET)
 	{
 		fprintf(stderr, "Could not create socket : %d" , WSAGetLastError());
-        exit(EXIT_FAILURE);
+		int err = WSAGetLastError();
+		WSACleanup();
+		return err;
 	}
+	g_listen = s;
 	// printf("Socket created.\n");
 	
 	// Prepare the sockaddr_in structure
@@ -129,29 +207,43 @@ int main()
 	// Bind
 	if( bind(s ,(struct sockaddr *)&server , sizeof(server)) == SOCKET_ERROR)
 	{
-		fprintf(stderr, "Bind failed with error code : %d" , WSAGetLastError());
-		exit(EXIT_FAILURE);
+		int err = WSAGetLastError();
+		fprintf(stderr, "Bind failed with error code : %d" , err);
+		closesocket(up);
+		closesocket(s);
+		WSACleanup();
+		return err;
 	}
 	// printf("Bind done");
 
 	disable_udp_connreset(s);
 	disable_udp_connreset(up);
 
+	set_status(SERVICE_RUNNING, NO_ERROR);   /* tell the SCM we're up (no-op in a console) */
+
+	int exit_code = 0;
+
 	// Keep listening for data
-	while(1)
+	while (!g_stopping)
 	{
 		// printf("Waiting for data...");
 		fflush(stdout);
-		
+
 		//clear the buffer by filling null, it might have previously received data
 		memset(buf,'\0', BUFLEN);
-		
+
 		// Try to receive some data, this is a blocking call
+		slen = sizeof(si_other);
 		if ((recv_len = recvfrom(s, buf, BUFLEN, 0, (struct sockaddr *) &si_other, &slen)) == SOCKET_ERROR)
 		{
-			fprintf(stderr, "recvfrom() failed with error code : %d" , WSAGetLastError());
-			exit(EXIT_FAILURE);
+			int err = WSAGetLastError();
+			if (g_stopping) break;                          /* socket closed by request_stop() */
+			if (err == WSAEMSGSIZE || err == WSAECONNRESET) continue;   /* one bad packet: skip it */
+			fprintf(stderr, "recvfrom() failed with error code : %d" , err);
+			exit_code = err;
+			break;
 		}
+		if (recv_len < DNS_HEADER_SIZE) continue;           /* too short to be a DNS query */
 		
 		// Decode the queried domain name, e.g. "www.youtube.com"
 		char qname[MAX_DOMAIN_LENGTH];
@@ -179,21 +271,61 @@ int main()
 				printf("upstream sendto failed: %d\n", WSAGetLastError());
 			}
 
+			/* Wait for the reply to THIS query. A late reply to an earlier query that
+			 * timed out has a different ID (bytes 0-1); skip it instead of sending
+			 * it to the wrong client. */
 			char reply[4096];
-			int reply_len = recvfrom(up, reply, sizeof reply, 0, NULL, NULL);
+			int reply_len;
+			do {
+				reply_len = recvfrom(up, reply, sizeof reply, 0, NULL, NULL);
+			} while (reply_len >= 2 && memcmp(reply, buf, 2) != 0);
+
 			if (reply_len == SOCKET_ERROR) {
 				printf("upstream recvfrom failed: %d\n", WSAGetLastError());   /* 10060 = timeout */
+			} else {
+				/* send the answer back to whoever asked */
+				sendto(s, reply, reply_len, 0, (struct sockaddr *)&si_other, sizeof(si_other));
 			}
-
-			/* send the answer back to whoever asked */
-			sendto(s, reply, reply_len, 0, (struct sockaddr *)&si_other, sizeof(si_other));
 		}
 
 	}
 
 	closesocket(up);
-	closesocket(s);
+	if (!g_stopping) closesocket(s);         /* request_stop() already closed it otherwise */
+	g_listen = INVALID_SOCKET;
 	WSACleanup();
-	
-	return 0;
+
+	return exit_code;
+}
+
+
+static void WINAPI service_main(DWORD argc, LPSTR *argv)
+{
+    (void)argc; (void)argv;
+    g_status_handle = RegisterServiceCtrlHandlerExA(SERVICE_NAME, service_ctrl, NULL);
+    if (!g_status_handle) return;
+
+    set_status(SERVICE_START_PENDING, NO_ERROR);
+    int rc = run_server();
+    /* A non-zero exit code makes the SCM apply the recovery actions (restart). */
+    set_status(SERVICE_STOPPED, rc ? (DWORD)rc : NO_ERROR);
+}
+
+
+int main(int argc, char *argv[])
+{
+    resolve_blocklist_path(argc, argv);
+
+    SERVICE_TABLE_ENTRYA table[] = {
+        { SERVICE_NAME, service_main },
+        { NULL, NULL }
+    };
+    if (StartServiceCtrlDispatcherA(table)) return 0;   /* ran as a service until stopped */
+
+    if (GetLastError() != ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) return 1;
+
+    /* Not started by the SCM: run in this console (Ctrl+C to stop). */
+    printf("Running in console mode, blocklist: %s\n", g_blocklist_path);
+    SetConsoleCtrlHandler(console_ctrl, TRUE);
+    return run_server();
 }
