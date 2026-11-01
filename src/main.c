@@ -25,6 +25,57 @@ static void disable_udp_connreset(SOCKET sock) {
 }
 
 
+#define DNS_HEADER_SIZE 12
+
+/*
+ * Decode the question name (QNAME) of a DNS packet into dotted, lowercase form,
+ * e.g. bytes 03 'w' 'w' 'w' 07 'y' 'o' 'u' 't' 'u' 'b' 'e' 03 'c' 'o' 'm' 00
+ * become "www.youtube.com". Each label is read using its own length byte, so
+ * label lengths no longer matter. Returns 0 on success, -1 on a malformed name.
+ */
+static int parse_qname(const unsigned char *buf, int len, char *out, size_t outsz)
+{
+    int i = DNS_HEADER_SIZE;
+    size_t o = 0;
+    while (i < len) {
+        unsigned lab = buf[i++];
+        if (lab == 0) { out[o] = '\0'; return 0; }               /* root label: end of name */
+        if (lab > 63 || i + (int)lab > len || o + lab + 2 > outsz)
+            return -1;                                           /* compression pointer, truncated, or too long */
+        if (o) out[o++] = '.';
+        for (unsigned k = 0; k < lab; k++)
+            out[o++] = (char)tolower(buf[i++]);
+    }
+    return -1;                                                   /* ran off the end without a root label */
+}
+
+/*
+ * Check the name and every parent domain against the blocklist:
+ * "www.youtube.com" checks "www.youtube.com", "youtube.com", then "com".
+ * blocked.txt entries have their dots removed (see clean_blocked.py), so each
+ * candidate is compared with its dots removed ("youtubecom").
+ */
+static int is_blocked(const char *name)
+{
+    char flat[MAX_DOMAIN_LENGTH];
+    const char *suffix = name;
+    while (*suffix) {
+        size_t o = 0;
+        for (const char *c = suffix; *c && o + 1 < sizeof flat; c++)
+            if (*c != '.') flat[o++] = *c;
+        flat[o] = '\0';
+
+        for (int i = 0; i < ndomains; i++)
+            if (strcmp(flat, domains[i]) == 0) return 1;
+
+        const char *dot = strchr(suffix, '.');
+        if (!dot) break;
+        suffix = dot + 1;                                        /* move to the parent domain */
+    }
+    return 0;
+}
+
+
 int main()
 {
     // Initialize the blocklist
@@ -98,35 +149,20 @@ int main()
 		// Try to receive some data, this is a blocking call
 		if ((recv_len = recvfrom(s, buf, BUFLEN, 0, (struct sockaddr *) &si_other, &slen)) == SOCKET_ERROR)
 		{
-			printf("recvfrom() failed with error code : %d" , WSAGetLastError());
+			fprintf(stderr, "recvfrom() failed with error code : %d" , WSAGetLastError());
 			exit(EXIT_FAILURE);
 		}
 		
-        #define HEADER_SIZE 13
-		#define DOT_CHARACTER 0x03
-
-		// Fill the query buffer with the domain name from the DNS query, filtering '.' characters
-		char *query = malloc(recv_len - HEADER_SIZE + 1);
-		int dotCount = 0;
-        for (int i = HEADER_SIZE; i < recv_len; i++) {
-			printf("%c", (unsigned char)buf[i]);
-			if ((unsigned char)buf[i] != DOT_CHARACTER) {
-				query[i - HEADER_SIZE - dotCount] = (unsigned char)buf[i];
-			} else {
-				dotCount++;
-			}
-		}
-		putchar('\n');
-		query[recv_len - HEADER_SIZE - dotCount] = '\0'; // Null-terminate the query string
-
+		// Decode the queried domain name, e.g. "www.youtube.com"
+		char qname[MAX_DOMAIN_LENGTH];
 		uint8_t isBlocked = 0;
-        for (int i = 0; i < ndomains; i++) {
-            if (strcmp(query, domains[i]) == 0) {
-                printf("Blocked: %s\n", (char *)&buf[HEADER_SIZE]);
-                isBlocked = 1;
-                break;
-            }
-        }
+		if (parse_qname((const unsigned char *)buf, recv_len, qname, sizeof qname) == 0) {
+			// printf("Query: %s\n", qname);
+			isBlocked = is_blocked(qname);
+			// if (isBlocked) printf("Blocked: %s\n", qname);
+		} else {
+			// printf("Query: <malformed name, forwarding>\n");
+		}
 
 		/* in the loop, for an allowed query */
 		if (isBlocked) {
@@ -153,8 +189,6 @@ int main()
 			sendto(s, reply, reply_len, 0, (struct sockaddr *)&si_other, sizeof(si_other));
 		}
 
-        // printf("\n");
-		free(query);
 	}
 
 	closesocket(up);

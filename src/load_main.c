@@ -21,12 +21,13 @@ int main(int argc, char *argv[])
             }
         }
 
+        // printf("Checking: %s\n", domains[773272]);
+
         for (int i = 0; i < ndomains; i++) {
             if (strcmp(buff, domains[i]) == 0) {
                 printf("Blocked: %s\n", buff);
                 break;
-            }
-            
+            } 
         }
     }
     
